@@ -1,283 +1,633 @@
-import re
-from typing import List, Dict, Any
-from fastapi import FastAPI
-from pydantic import BaseModel
+"""
+خدمة FastAPI لمعالجة العربية لمنصة التحليل اللساني.
 
-app = FastAPI(title="Arabic NLP Service")
+تشغيل محلي:
+  pip install fastapi uvicorn pydantic camel-tools
+  uvicorn api_nlp_service:app --host 0.0.0.0 --port 8000
+
+على Render:
+  Build Command: pip install -r requirements.txt
+  Start Command: uvicorn api_nlp_service:app --host 0.0.0.0 --port $PORT
+
+النهايات:
+  GET  /health
+  POST /analyze
+  POST /classify
+  POST /summarize
+  POST /suggest_tags
+  GET  /docs
+  GET  /openapi.json
+"""
+from __future__ import annotations
+
+import math
+import os
+import re
+import subprocess
+from collections import Counter
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Tuple
+
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+
+app = FastAPI(
+    title="Arabic Linguistic Platform NLP API",
+    version="2.1.0",
+    description=(
+        "Arabic NLP service with CAMeL Tools when available, optional Farasa hook, "
+        "improved clitic-aware fallback, classification, summarization, and tag suggestion."
+    ),
+)
+
 
 class TextRequest(BaseModel):
-    text: str
-    text_type: str | None = "عام"
+    text: str = Field(..., min_length=1)
+    language: str = "ar"
+    max_items: int = 20
 
-ARABIC_DIACRITICS = re.compile(r"[\u064B-\u065F\u0670\u06D6-\u06ED]")
-PUNCT = re.compile(r"[^\u0621-\u063A\u0641-\u064A\s]")
 
-PREPOSITIONS = {
-    "من", "الى", "إلى", "الي", "عن", "على", "علي", "في", "ب", "ك", "ل",
-    "حتى", "حتي", "رب", "منذ", "خلا", "عدا", "حاشا"
+class AnalyzeRequest(TextRequest):
+    engine: str = "auto"  # auto | camel | farasa | fallback
+    split_clitics: bool = True
+    include_debug: bool = False
+
+
+DIAC = re.compile(r"[\u064B-\u065F\u0670\u0640\u06D6-\u06ED]")
+AR_WORD = re.compile(r"[\u0621-\u063A\u0641-\u064A]+", re.UNICODE)
+SENT_SPLIT = re.compile(r"[.!؟?؛،\n]+")
+
+# Normalized sets are used for matching after hamza/alef/ya normalization.
+RAW_STOPWORDS = """
+من إلى الى عن على علي في ثم أو او أم ام بل لكن لا لم لن قد هل حتى حتي إذا اذا إن ان أن ما كي لعل ليت رب هذا هذه ذلك تلك هو هي هم هن نحن انا أنا كان كانت يكون كل غير بعد قبل بين عند مع كما وقد فقد و ف ب ك ل
+""".split()
+
+RAW_PREPOSITIONS = {
+    "من", "إلى", "الى", "الي", "عن", "على", "علي", "في", "ب", "ك", "ل", "رب", "حتى", "حتي", "منذ", "خلا", "عدا", "حاشا"
 }
-
-CONJUNCTIONS = {
-    "و", "ف", "ثم", "او", "أو", "ام", "أم", "بل", "لكن"
+RAW_CONJUNCTIONS = {"و", "ف", "ثم", "أو", "او", "أم", "ام", "بل", "لكن"}
+RAW_PARTICLES = {
+    "أن", "ان", "إن", "لن", "لم", "لا", "ما", "قد", "هل", "ليت", "لعل", "كي", "حتى", "حتي", "إذا", "اذا", "إذ", "اذ"
 }
-
-PARTICLES = {
-    "ان", "أن", "إن", "لن", "لم", "لا", "ما", "قد", "هل", "ليت", "لعل",
-    "كي", "حتى", "حتي", "اذا", "إذا", "اذ", "إذ"
+RAW_PRONOUNS = {
+    "أنا", "انا", "أنت", "انت", "أنتما", "انتما", "أنتم", "انتم", "أنتن", "انتن", "هو", "هي", "نحن", "هم", "هن", "هما",
+    "ت", "نا", "ي", "ك", "ه", "ها", "كم", "كن", "كما", "هما"
 }
-
-PRONOUNS = {
-    "انا", "أنا", "نحن", "انت", "أنت", "انتم", "أنتم", "هو", "هي", "هم", "هن",
-    "كما", "كم", "كن", "نا", "ي", "ك", "ه", "ها", "هما", "هم", "هن"
-}
-
-DEMONSTRATIVES = {
-    "هذا", "هذه", "ذلك", "تلك", "هؤلاء", "اولئك", "أولئك", "هنا", "هناك"
-}
-
-RELATIVES = {
-    "الذي", "التي", "اللذان", "اللتان", "الذين", "اللاتي", "اللواتي", "من", "ما"
-}
-
-QUESTION_NAMES = {
-    "من", "ما", "ماذا", "متى", "متي", "اين", "أين", "كيف", "كم", "اي", "أي", "ايها", "أيها"
-}
-
-COMMON_VERB_PREFIXES = ("س", "ي", "ت", "ن", "أ", "ا")
-ATTACHED_PREFIXES = ("وال", "فال", "بال", "كال", "لل", "و", "ف", "ب", "ك", "ل")
-ATTACHED_SUFFIXES = ("كما", "هما", "كم", "كن", "نا", "ها", "هم", "هن", "ه", "ك", "ي", "ا")
+RAW_DEMONSTRATIVES = {"هذا", "هذه", "ذلك", "تلك", "هؤلاء", "هنا", "هناك", "أولئك", "اولئك"}
+RAW_RELATIVES = {"الذي", "التي", "الذين", "اللاتي", "اللائي", "اللواتي", "اللذان", "اللتان", "من", "ما"}
+RAW_INTERROGATIVES = {"من", "ما", "ماذا", "متى", "متي", "اين", "أين", "كيف", "كم", "أي", "اي", "لماذا", "أيها", "ايها"}
 
 KNOWN_VERBS = {
-    "كان", "كنت", "وجد", "وجدت", "سأل", "سألت", "مضى", "خرج", "عاش", "حل",
-    "بنى", "بناه", "ترك", "تركت", "أصبح", "أصبحت", "أحمل", "أضم", "أدرك",
-    "استعدوا", "يستمر", "أستيقظ", "يهمك", "تحتاج", "يقلب", "أقلب", "انتظر",
-    "أنتظر", "أسمع", "يأتي", "يأتينا", "يخبر", "ليخبرنا", "يهذي", "يجتاحني"
+    "كان", "كنت", "كانت", "يكون", "سأل", "سألت", "سال", "سالت", "وجد", "وجدت", "أكون", "اكون", "مضى", "مضي",
+    "أقلب", "اقلب", "أنتظر", "انتظر", "أسمع", "اسمع", "يأتي", "ياتي", "يأتينا", "ياتينا", "يخبر", "ليخبرنا",
+    "خرج", "يهذي", "يجتاحني", "أفعله", "افعله", "حل", "عاش", "بنى", "بناه", "ترك", "تركت", "تركته", "يستمر",
+    "أستيقظ", "استيقظ", "أدرك", "ادرك", "استعدوا", "فتحت", "أصبحت", "اصبحت", "أحمل", "احمل", "أضم", "اضم",
+    "يهمك", "تحتاج", "نعرض", "يلي", "ساءت", "ليست", "فليست"
 }
 
+CATEGORY_KEYWORDS = {
+    "شعر": ["قصيدة", "بيت", "قافية", "شاعر", "أبيات", "بحر", "غزل"],
+    "خطبة": ["أيها", "الحمد", "السلام", "الناس", "أوصيكم", "أما بعد"],
+    "أكاديمي": ["بحث", "دراسة", "منهج", "نتائج", "مراجع", "فرضية", "تحليل"],
+    "إعلامي": ["قال", "أعلن", "أخبار", "تقرير", "مصادر", "صحيفة", "وكالة"],
+    "تعليمي": ["درس", "شرح", "تمرين", "الطلاب", "تعلم", "المعلم", "الصف"],
+    "سردي": ["كان", "كنت", "قال", "ذهب", "عاد", "رأى", "وجد", "فجأة"],
+    "تراثي": ["قال", "روي", "حدثنا", "باب", "فصل", "رحمه", "كتاب"],
+}
+
+
+# -----------------------------------------------------------------------------
+# Normalization and basic tokenization
+# -----------------------------------------------------------------------------
+
 def strip_diacritics(text: str) -> str:
-    return ARABIC_DIACRITICS.sub("", text)
+    return DIAC.sub("", text or "")
 
-def normalize_arabic(text: str) -> str:
+
+def normalize(text: str) -> str:
     text = strip_diacritics(text)
-    text = text.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+    text = text.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ٱ", "ا")
     text = text.replace("ى", "ي").replace("ؤ", "و").replace("ئ", "ي")
-    text = text.replace("ة", "ة")
     return text
 
-def clean_text(text: str) -> str:
-    text = strip_diacritics(text)
-    text = PUNCT.sub(" ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
 
-def is_particle(word: str) -> bool:
-    n = normalize_arabic(word)
-    return word in PREPOSITIONS or n in PREPOSITIONS or word in CONJUNCTIONS or n in CONJUNCTIONS or word in PARTICLES or n in PARTICLES
+def nset(items: set[str] | list[str]) -> set[str]:
+    return {normalize(x) for x in items}
 
-def particle_type(word: str) -> str:
-    n = normalize_arabic(word)
-    if word in PREPOSITIONS or n in PREPOSITIONS:
-        return "نوع الأداة: حرف جر"
-    if word in CONJUNCTIONS or n in CONJUNCTIONS:
-        return "نوع الحرف: حرف عطف"
-    return "نوع الأداة: حرف"
 
-def is_special_noun(word: str) -> str | None:
-    n = normalize_arabic(word)
-    if word in PRONOUNS or n in PRONOUNS:
-        return "نوع الضمير/الاسم: ضمير شخصي"
-    if word in DEMONSTRATIVES or n in DEMONSTRATIVES:
-        return "نوع الضمير/الاسم: اسم إشارة"
-    if word in RELATIVES or n in RELATIVES:
-        return "نوع الضمير/الاسم: اسم موصول"
-    if word in QUESTION_NAMES or n in QUESTION_NAMES:
-        return "نوع الضمير/الاسم: اسم استفهام"
-    return None
+STOPWORDS = nset(RAW_STOPWORDS)
+PREPOSITIONS = nset(RAW_PREPOSITIONS)
+CONJUNCTIONS = nset(RAW_CONJUNCTIONS)
+PARTICLES = nset(RAW_PARTICLES)
+PRONOUNS = nset(RAW_PRONOUNS)
+DEMONSTRATIVES = nset(RAW_DEMONSTRATIVES)
+RELATIVES = nset(RAW_RELATIVES)
+INTERROGATIVES = nset(RAW_INTERROGATIVES)
+KNOWN_VERBS_N = nset(KNOWN_VERBS)
 
-def split_attached(word: str) -> List[str]:
-    original = word
-    n = normalize_arabic(word)
 
-    if is_particle(word):
-        return [word]
+def clean_word(word: str) -> str:
+    # Keep Arabic letters only; remove punctuation such as ، ؛ ؟ etc.
+    return "".join(AR_WORD.findall(strip_diacritics(word or "")))
 
-    parts = []
 
-    # handle و / ف before a real word
-    if len(word) > 2 and word[0] in ("و", "ف"):
-        rest = word[1:]
-        if rest and not is_particle(word):
-            parts.append(word[0])
-            word = rest
-            n = normalize_arabic(word)
+def words(text: str) -> List[str]:
+    return [w for w in (clean_word(x) for x in AR_WORD.findall(text or "")) if w]
 
-    # handle single-letter prepositions
-    if len(word) > 3 and word[0] in ("ب", "ك", "ل"):
-        rest = word[1:]
-        parts.append(word[0])
-        word = rest
-        n = normalize_arabic(word)
 
-    # suffix pronouns
+def sentences(text: str) -> List[str]:
+    return [s.strip() for s in SENT_SPLIT.split(text or "") if s.strip()]
+
+
+def is_single_letter_particle(part: str) -> bool:
+    return normalize(part) in {"و", "ف", "ب", "ك", "ل"}
+
+
+# -----------------------------------------------------------------------------
+# Clitic splitting
+# -----------------------------------------------------------------------------
+
+def split_attached_word(surface: str) -> List[str]:
+    """Split common Arabic proclitics/enclitics for the platform output.
+
+    This is intentionally conservative and designed to match the project report style:
+    وأوزانها -> و + أوزان + ها
+    بجذورها -> ب + جذور + ها
+    إلى stays one token.
+    """
+    w = clean_word(surface)
+    if not w:
+        return []
+
+    n = normalize(w)
+    if n in PREPOSITIONS or n in CONJUNCTIONS or n in PARTICLES or n in PRONOUNS:
+        return [w]
+
+    parts: List[str] = []
+
+    # Conjunction proclitic: و / ف
+    if len(w) > 2 and normalize(w[0]) in {"و", "ف"}:
+        rest = w[1:]
+        rest_n = normalize(rest)
+        # Do not split if the whole word is a known lexical item; otherwise split.
+        if n not in KNOWN_VERBS_N and rest_n not in {"احد", "اخر"}:
+            parts.append(w[0])
+            w = rest
+            n = normalize(w)
+
+    # Prepositional proclitic: ب / ك / ل
+    # Avoid false split in verbs/nouns like بناه, كان, كتب when the whole word is known.
+    if len(w) > 3 and normalize(w[0]) in {"ب", "ك", "ل"} and n not in KNOWN_VERBS_N:
+        rest = w[1:]
+        if len(rest) >= 2:
+            parts.append(w[0])
+            w = rest
+            n = normalize(w)
+
+    # Suffix pronouns. Longest first.
     suffix = ""
-    for s in ATTACHED_SUFFIXES:
-        if len(word) > len(s) + 2 and word.endswith(s):
-            suffix = s
-            word = word[:-len(s)]
+    for s in ["كما", "هما", "كم", "كن", "نا", "ها", "هم", "هن", "ه", "ك", "ي"]:
+        if len(w) > len(s) + 2 and normalize(w).endswith(normalize(s)):
+            # Avoid stripping final ي from ordinary nisba/adjectives when no obvious pronoun context.
+            if s == "ي" and normalize(w).endswith(("ية", "عي", "سي", "بي")):
+                continue
+            suffix = w[-len(s):]
+            w = w[:-len(s)]
             break
 
-    if word:
-        parts.append(word)
+    if w:
+        parts.append(w)
     if suffix:
         parts.append(suffix)
 
-    return parts if parts else [original]
+    return parts or [clean_word(surface)]
 
-def guess_pos(part: str) -> tuple[str, str]:
-    n = normalize_arabic(part)
 
-    if is_particle(part):
-        return "حرف", particle_type(part)
+def expanded_tokens(text: str, split_clitics: bool = True) -> List[Tuple[str, str, str]]:
+    """Return (surface, part, position) where position is 1.1 style."""
+    out: List[Tuple[str, str, str]] = []
+    for word_index, surface in enumerate(words(text), start=1):
+        parts = split_attached_word(surface) if split_clitics else [surface]
+        sub = 1
+        for part in parts:
+            part = clean_word(part)
+            if not part:
+                continue
+            out.append((surface, part, f"{word_index}.{sub}"))
+            sub += 1
+    return out
 
-    special = is_special_noun(part)
-    if special:
-        return "اسم", special
 
-    if n.startswith("ال") and len(n) > 3:
-        return "اسم", "التعريف: معرفة"
+# -----------------------------------------------------------------------------
+# Fallback morphology
+# -----------------------------------------------------------------------------
 
-    if part in ATTACHED_SUFFIXES or n in PRONOUNS:
-        return "اسم", "نوع الضمير/الاسم: ضمير شخصي"
+def fallback_pos(w: str) -> str:
+    n = normalize(w)
+    if n in PREPOSITIONS or n in CONJUNCTIONS or n in PARTICLES or is_single_letter_particle(w):
+        return "حرف"
+    if n in PRONOUNS or n in DEMONSTRATIVES or n in RELATIVES or n in INTERROGATIVES:
+        return "اسم"
+    if n.startswith("ال") or n.endswith(("ة", "ات", "ون", "ين", "ية")):
+        return "اسم"
+    if n in KNOWN_VERBS_N:
+        return "فعل"
+    if n.startswith(("ي", "ت", "ن")) and len(n) >= 4:
+        return "فعل"
+    if n.startswith("ا") and len(n) >= 4 and n in KNOWN_VERBS_N:
+        return "فعل"
+    return "اسم"
 
-    if part in KNOWN_VERBS or n in {normalize_arabic(v) for v in KNOWN_VERBS}:
-        return "فعل", "صيغة الفعل: فعل مصرف"
 
-    if n.startswith(("ي", "ت", "ن", "ا")) and len(n) >= 4:
-        # avoid classifying common nouns as verbs too aggressively
-        if not n.startswith("ال"):
-            return "فعل", "زمن/تمام الفعل: غير تام / مضارع، صيغة الفعل: فعل مصرف"
+def fallback_features(w: str, pos: str) -> str:
+    n = normalize(w)
+    features: List[str] = []
+    if pos == "حرف":
+        if n in PREPOSITIONS or n in {"ب", "ك", "ل"}:
+            features.append("نوع الأداة: حرف جر")
+        elif n in CONJUNCTIONS or n in {"و", "ف"}:
+            features.append("نوع الحرف: حرف عطف")
+        else:
+            features.append("نوع الأداة: حرف")
+    elif pos == "فعل":
+        if n.startswith(("ي", "ت", "ن", "ا")):
+            features.append("زمن/تمام الفعل: غير تام / مضارع")
+            features.append("صيغة الفعل: مرفوع")
+        else:
+            features.append("زمن/تمام الفعل: تام / ماض")
+        features.append("صيغة الفعل: فعل مصرف")
+        features.append("البناء: مبني للمعلوم")
+    else:
+        if n.startswith("ال"):
+            features.append("التعريف: معرفة")
+        elif n not in PRONOUNS:
+            features.append("التعريف: نكرة")
+        if n in PRONOUNS:
+            features.append("نوع الضمير/الاسم: ضمير شخصي")
+        if n in DEMONSTRATIVES:
+            features.append("نوع الضمير/الاسم: اسم إشارة")
+        if n in RELATIVES:
+            features.append("نوع الضمير/الاسم: اسم موصول")
+        if n in INTERROGATIVES:
+            features.append("نوع الضمير/الاسم: اسم استفهام")
+        if n.endswith(("ة", "ية")):
+            features.append("الجنس: مؤنث محتمل")
+        if n.endswith(("ات", "ون", "ين")):
+            features.append("العدد: جمع")
+        elif n not in PRONOUNS:
+            features.append("العدد: مفرد")
+    return "، ".join(features)
 
-    if n.endswith(("ت")) and len(n) >= 3:
-        return "فعل", "زمن/تمام الفعل: تام / ماض، صيغة الفعل: فعل مصرف"
 
-    return "اسم", "التعريف: نكرة"
+def fallback_stem_prefix_suffix(w: str, pos: str) -> Tuple[str, str, str]:
+    n = normalize(w)
+    prefix = ""
+    suffix = ""
+    stem = w
+
+    if pos != "حرف" and n.startswith("ال") and len(w) > 3:
+        prefix = "ال"
+        stem = w[2:]
+
+    for s in ["كما", "هما", "كم", "كن", "نا", "ها", "هم", "هن", "ه", "ك", "ي"]:
+        if len(stem) > len(s) + 2 and normalize(stem).endswith(normalize(s)):
+            suffix = stem[-len(s):]
+            stem = stem[:-len(s)]
+            break
+    return prefix, stem, suffix
+
 
 def guess_root(stem: str) -> str:
-    n = normalize_arabic(stem)
+    n = normalize(stem)
     n = re.sub(r"^ال", "", n)
     n = re.sub(r"^(و|ف|ب|ك|ل)", "", n)
     n = re.sub(r"(كما|هما|كم|كن|نا|ها|هم|هن|ه|ك|ي)$", "", n)
-    letters = [c for c in n if re.match(r"[\u0621-\u063A\u0641-\u064A]", c)]
-    return "".join(letters[:3]) if letters else n
+    letters = [c for c in n if AR_WORD.fullmatch(c)]
+    return "".join(letters[:3]) if letters else n[:3]
 
-def analyze_fallback(text: str) -> Dict[str, Any]:
-    text = clean_text(text)
-    words = text.split()
-    tokens = []
-    pos_counts = {}
-    pos = 1
 
-    for surface in words:
-        parts = split_attached(surface)
-        sub = 1
+def fallback_token(surface: str, part: str, position: str) -> Dict[str, Any]:
+    clean = clean_word(part)
+    n = normalize(clean)
+    pos = fallback_pos(clean)
+    prefix, stem, suffix = fallback_stem_prefix_suffix(clean, pos)
+    return {
+        "position": position,
+        "surface": surface,
+        "word": clean,
+        "normalized": n,
+        "lemma": normalize(stem) if stem else n,
+        "root": guess_root(stem if stem else clean),
+        "pattern": "غير محدد",
+        "pos": pos,
+        "prefix": prefix,
+        "stem": stem,
+        "suffix": suffix,
+        "features": fallback_features(clean, pos),
+        "confidence": "fallback-rule-improved",
+    }
 
-        for part in parts:
-            clean_part = clean_text(part)
-            if not clean_part:
-                continue
 
-            part_pos, features = guess_pos(clean_part)
-            pos_counts[part_pos] = pos_counts.get(part_pos, 0) + 1
+# -----------------------------------------------------------------------------
+# CAMeL Tools integration
+# -----------------------------------------------------------------------------
 
-            n = normalize_arabic(clean_part)
-            prefix = ""
-            stem = clean_part
-            suffix = ""
+_camel_mle = None
+_camel_load_error: Optional[str] = None
 
-            if clean_part in ("و", "ف", "ب", "ك", "ل"):
-                prefix = ""
-                stem = clean_part
-            elif part_pos == "اسم" and n.startswith("ال") and len(n) > 3:
-                prefix = "ال"
-                stem = clean_part[2:]
 
-            for s in ATTACHED_SUFFIXES:
-                if len(stem) > len(s) + 2 and stem.endswith(s):
-                    suffix = s
-                    stem = stem[:-len(s)]
-                    break
+def camel_tools_installed() -> bool:
+    try:
+        import camel_tools  # noqa: F401
+        return True
+    except Exception:
+        return False
 
-            tokens.append({
-                "position": f"{pos}.{sub}",
-                "surface": surface,
-                "word": clean_part,
-                "normalized": n,
-                "lemma": stem if stem else clean_part,
-                "root": guess_root(stem if stem else clean_part),
-                "pattern": "غير محدد",
-                "pos": part_pos,
-                "prefix": prefix,
-                "stem": stem,
-                "suffix": suffix,
-                "features": features,
-                "confidence": "fallback-rule-improved"
-            })
 
-            sub += 1
+@lru_cache(maxsize=1)
+def camel_normalized_pos_sets() -> Dict[str, set[str]]:
+    return {
+        "prep": PREPOSITIONS,
+        "conj": CONJUNCTIONS,
+        "part": PARTICLES,
+        "pron": PRONOUNS,
+    }
 
-        pos += 1
+
+def get_camel_mle():
+    global _camel_mle, _camel_load_error
+    if _camel_mle is not None:
+        return _camel_mle
+    try:
+        from camel_tools.disambig.mle import MLEDisambiguator
+        _camel_mle = MLEDisambiguator.pretrained()
+        _camel_load_error = None
+        return _camel_mle
+    except Exception as exc:  # keep service alive and expose reason in debug
+        _camel_load_error = str(exc)
+        return None
+
+
+def map_camel_pos(pos_en: str, part: str) -> str:
+    p = (pos_en or "").lower()
+    n = normalize(part)
+    if n in PREPOSITIONS or n in CONJUNCTIONS or n in PARTICLES or is_single_letter_particle(part):
+        return "حرف"
+    if p.startswith("verb") or p in {"verb", "iv", "pv", "cv"}:
+        return "فعل"
+    if p in {"prep", "conj", "part", "punc", "sub_conj", "interrog_part"}:
+        return "حرف"
+    return "اسم"
+
+
+def arabic_camel_features(ana: Dict[str, Any], part: str, pos: str) -> str:
+    features: List[str] = []
+    n = normalize(part)
+    if pos == "حرف":
+        if n in PREPOSITIONS or n in {"ب", "ك", "ل"}:
+            return "نوع الأداة: حرف جر"
+        if n in CONJUNCTIONS or n in {"و", "ف"}:
+            return "نوع الحرف: حرف عطف"
+        return "نوع الأداة: حرف"
+
+    if pos == "فعل":
+        asp = ana.get("asp") or ""
+        if asp == "p":
+            features.append("زمن/تمام الفعل: تام / ماض")
+        elif asp == "i":
+            features.append("زمن/تمام الفعل: غير تام / مضارع")
+        elif asp:
+            features.append(f"الزمن/التمام: {asp}")
+        vox = ana.get("vox")
+        if vox == "a":
+            features.append("البناء: مبني للمعلوم")
+        elif vox == "p":
+            features.append("البناء: مبني للمجهول")
+        features.append("صيغة الفعل: فعل مصرف")
+    else:
+        stt = ana.get("stt") or ""
+        cas = ana.get("cas") or ""
+        gen = ana.get("gen") or ""
+        num = ana.get("num") or ""
+        if n.startswith("ال") or stt == "d":
+            features.append("التعريف: معرفة")
+        elif stt == "i":
+            features.append("التعريف: نكرة")
+        if cas == "n":
+            features.append("الحالة الإعرابية: مرفوع")
+        elif cas == "a":
+            features.append("الحالة الإعرابية: منصوب")
+        elif cas == "g":
+            features.append("الحالة الإعرابية: مجرور")
+        if gen == "m":
+            features.append("الجنس: مذكر")
+        elif gen == "f":
+            features.append("الجنس: مؤنث")
+        if num == "s":
+            features.append("العدد: مفرد")
+        elif num == "d":
+            features.append("العدد: مثنى")
+        elif num == "p":
+            features.append("العدد: جمع")
+        if n in PRONOUNS:
+            features.append("نوع الضمير/الاسم: ضمير شخصي")
+        if n in DEMONSTRATIVES:
+            features.append("نوع الضمير/الاسم: اسم إشارة")
+        if n in RELATIVES:
+            features.append("نوع الضمير/الاسم: اسم موصول")
+        if n in INTERROGATIVES:
+            features.append("نوع الضمير/الاسم: اسم استفهام")
+
+    return "، ".join(features)
+
+
+def camel_token(surface: str, part: str, position: str, ana: Dict[str, Any]) -> Dict[str, Any]:
+    clean = clean_word(part)
+    n = normalize(clean)
+    pos = map_camel_pos(str(ana.get("pos", "")), clean)
+
+    # For one-letter clitics and known particles, avoid misleading CAMeL stems/prefixes.
+    if pos == "حرف":
+        return {
+            "position": position,
+            "surface": surface,
+            "word": clean,
+            "normalized": n,
+            "lemma": n,
+            "root": n,
+            "pattern": "حرف",
+            "pos": "حرف",
+            "prefix": "",
+            "stem": clean,
+            "suffix": "",
+            "features": arabic_camel_features(ana, clean, "حرف"),
+            "confidence": "camel-tools+rules",
+        }
+
+    prefix, fallback_stem, suffix = fallback_stem_prefix_suffix(clean, pos)
+    lemma = ana.get("lex") or ana.get("lemma") or normalize(fallback_stem or clean)
+    root = ana.get("root") or guess_root(fallback_stem or clean)
+    stem = ana.get("stem") or fallback_stem or clean
+    pattern = ana.get("pattern") or ana.get("bw") or "غير محدد"
 
     return {
-        "ok": True,
-        "engine": "fallback-rule-improved",
-        "meta": {
-            "token_count": len(tokens),
-            "pos_counts": pos_counts
-        },
-        "tokens": tokens
+        "position": position,
+        "surface": surface,
+        "word": clean,
+        "normalized": n,
+        "lemma": lemma,
+        "root": root,
+        "pattern": pattern,
+        "pos": pos,
+        "prefix": prefix,
+        "stem": stem,
+        "suffix": suffix,
+        "features": arabic_camel_features(ana, clean, pos),
+        "confidence": "camel-tools",
     }
+
+
+def camel_analyze_units(units: List[Tuple[str, str, str]]) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    mle = get_camel_mle()
+    if mle is None:
+        return None, _camel_load_error
+
+    parts = [part for _, part, _ in units]
+    try:
+        disambig = mle.disambiguate(parts)
+    except Exception as exc:
+        return None, str(exc)
+
+    out: List[Dict[str, Any]] = []
+    for unit, item in zip(units, disambig):
+        surface, part, position = unit
+        if not getattr(item, "analyses", None):
+            out.append(fallback_token(surface, part, position))
+            continue
+        ana = item.analyses[0].analysis
+        out.append(camel_token(surface, part, position, ana))
+    return out, None
+
+
+# -----------------------------------------------------------------------------
+# Optional Farasa hook
+# -----------------------------------------------------------------------------
+
+def farasa_segment(text: str) -> Optional[List[str]]:
+    jar = os.environ.get("FARASA_SEGMENTER_JAR")
+    if not jar or not os.path.exists(jar):
+        return None
+    try:
+        p = subprocess.run(
+            ["java", "-jar", jar],
+            input=text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+        )
+        if p.returncode == 0 and p.stdout.strip():
+            return p.stdout.split()
+    except Exception:
+        return None
+    return None
+
+
+# -----------------------------------------------------------------------------
+# API endpoints
+# -----------------------------------------------------------------------------
 
 @app.get("/health")
-def health():
+def health() -> Dict[str, Any]:
+    mle = get_camel_mle() if camel_tools_installed() else None
     return {
         "ok": True,
-        "engine": "fallback-rule-improved",
-        "camel_available": False
+        "service": "Arabic NLP Service",
+        "version": "2.1.0",
+        "camel_tools_available": camel_tools_installed(),
+        "camel_model_loaded": mle is not None,
+        "camel_model_error": None if mle is not None else _camel_load_error,
+        "farasa_jar_configured": bool(os.environ.get("FARASA_SEGMENTER_JAR")),
     }
 
+
 @app.post("/analyze")
-def analyze(req: TextRequest):
-    return analyze_fallback(req.text)
+def analyze(req: AnalyzeRequest) -> Dict[str, Any]:
+    units = expanded_tokens(req.text, split_clitics=req.split_clitics)
+    engine_used = "fallback-rule-improved"
+    tokens: Optional[List[Dict[str, Any]]] = None
+    debug: Dict[str, Any] = {}
+
+    if req.engine in {"auto", "camel"}:
+        tokens, err = camel_analyze_units(units)
+        if tokens is not None:
+            engine_used = "camel-tools+clitic-rules"
+        elif err:
+            debug["camel_error"] = err
+
+    if tokens is None and req.engine in {"auto", "farasa"}:
+        seg = farasa_segment(req.text)
+        if seg:
+            farasa_units = [(clean_word(w), clean_word(w), str(i)) for i, w in enumerate(seg, start=1) if clean_word(w)]
+            tokens = [fallback_token(surface, part, position) for surface, part, position in farasa_units]
+            engine_used = "farasa-segmenter+fallback-rules"
+
+    if tokens is None:
+        tokens = [fallback_token(surface, part, position) for surface, part, position in units]
+
+    pos_counts = Counter(t.get("pos", "غير محدد") for t in tokens)
+    result: Dict[str, Any] = {
+        "ok": True,
+        "engine": engine_used,
+        "meta": {
+            "token_count": len(tokens),
+            "pos_counts": dict(pos_counts),
+            "split_clitics": req.split_clitics,
+        },
+        "tokens": tokens,
+    }
+    if req.include_debug:
+        result["debug"] = debug
+    return result
+
 
 @app.post("/classify")
-def classify(req: TextRequest):
-    text = req.text
-    if any(w in text for w in ["قال", "رأى", "كان", "ذهب", "عاد"]):
-        label = "سرد / قصة"
-    elif any(w in text for w in ["بحث", "دراسة", "منهج", "نتائج"]):
-        label = "نص أكاديمي"
-    elif any(w in text for w in ["أيها", "الحمد", "السلام عليكم"]):
-        label = "خطبة / خطاب"
-    else:
-        label = "عام"
-    return {"ok": True, "label": label, "confidence": "rule-based"}
+def classify(req: TextRequest) -> Dict[str, Any]:
+    txt = normalize(req.text)
+    scores: Dict[str, int] = {}
+    for cat, kws in CATEGORY_KEYWORDS.items():
+        scores[cat] = sum(txt.count(normalize(k)) for k in kws)
+    if not any(scores.values()):
+        scores["عام"] = 1
+    total = sum(scores.values()) or 1
+    ranked = sorted(
+        [{"label": k, "score": v, "confidence": round(v / total, 4)} for k, v in scores.items()],
+        key=lambda x: x["score"],
+        reverse=True,
+    )
+    return {"ok": True, "engine": "keyword-classifier", "classification": ranked[: req.max_items]}
+
 
 @app.post("/summarize")
-def summarize(req: TextRequest):
-    clean = clean_text(req.text)
-    sentences = re.split(r"[.!؟?؛،]+|\n+", req.text)
-    sentences = [s.strip() for s in sentences if s.strip()]
-    summary = " ".join(sentences[:3]) if sentences else clean[:300]
-    return {"ok": True, "summary": summary}
+def summarize(req: TextRequest) -> Dict[str, Any]:
+    sents = sentences(req.text)
+    ws = [normalize(w) for w in words(req.text)]
+    freq = Counter(w for w in ws if w not in STOPWORDS and len(w) > 2)
+    scored = []
+    for idx, sent in enumerate(sents):
+        toks = [normalize(w) for w in words(sent)]
+        score = sum(freq.get(t, 0) for t in toks) / max(1, len(toks))
+        scored.append((score, idx, sent))
+    top_n = max(1, min(req.max_items or 3, 8, math.ceil(len(sents) * 0.25) if sents else 1))
+    selected = sorted(sorted(scored, reverse=True)[:top_n], key=lambda x: x[1])
+    summary = " ".join(sent for _, _, sent in selected)
+    return {"ok": True, "engine": "extractive-frequency", "summary": summary, "sentences": [s for _, _, s in selected]}
+
 
 @app.post("/suggest_tags")
-def suggest_tags(req: TextRequest):
-    clean = clean_text(req.text)
-    words = [normalize_arabic(w) for w in clean.split() if len(w) > 3]
-    freq = {}
-    for w in words:
-        if w in PREPOSITIONS or w in PARTICLES or w in CONJUNCTIONS:
-            continue
-        freq[w] = freq.get(w, 0) + 1
-    tags = sorted(freq, key=freq.get, reverse=True)[:10]
-    return {"ok": True, "tags": tags}
+def suggest_tags(req: TextRequest) -> Dict[str, Any]:
+    units = expanded_tokens(req.text, split_clitics=True)
+    terms = [normalize(part) for _, part, _ in units]
+    freq = Counter(w for w in terms if len(w) > 2 and w not in STOPWORDS and w not in PREPOSITIONS and w not in PARTICLES)
+    tags = [{"tag": w, "score": c} for w, c in freq.most_common(req.max_items or 20)]
+    return {"ok": True, "engine": "tf-frequency-tags", "tags": tags}
