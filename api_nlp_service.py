@@ -85,15 +85,6 @@ KNOWN_VERBS = {
     "يهمك", "تحتاج", "نعرض", "يلي", "ساءت", "ليست", "فليست"
 }
 
-# Words whose final/initial letters are lexical, not detachable clitics.
-# This list addresses recurrent false splits observed in the paired platform reports.
-LEXICAL_NO_SPLIT = nset({
-    "الذي", "التي", "الذين", "اللاتي", "اللائي", "اللذان", "اللتان",
-    "الماضي", "ماضي", "فجأة", "يهذي", "يأتي", "يلي", "يجتاحني",
-    "هذيانا", "جنونا", "حلما", "صفحة", "صفحات", "عملية", "الحياة",
-    "حاسوبية", "عربية", "ثرية", "لتوه"
-})
-
 VALID_PREFIX_CLITICS = {"و", "ف", "ب", "ك", "ل"}
 VALID_SUFFIX_PRONOUNS = ["كما", "هما", "كم", "كن", "نا", "ها", "هم", "هن", "ه", "ك", "ي"]
 
@@ -125,6 +116,16 @@ def normalize(text: str) -> str:
 
 def nset(items: set[str] | list[str]) -> set[str]:
     return {normalize(x) for x in items}
+
+
+# Words whose final/initial letters are lexical, not detachable clitics.
+# This list addresses recurrent false splits observed in the paired platform reports.
+LEXICAL_NO_SPLIT = nset({
+    "الذي", "التي", "الذين", "اللاتي", "اللائي", "اللذان", "اللتان",
+    "الماضي", "ماضي", "فجأة", "يهذي", "يأتي", "يلي", "يجتاحني",
+    "هذيانا", "جنونا", "حلما", "صفحة", "صفحات", "عملية", "الحياة",
+    "حاسوبية", "عربية", "ثرية", "لتوه"
+})
 
 
 STOPWORDS = nset(RAW_STOPWORDS)
