@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(
     title="Arabic Linguistic Platform NLP API",
-    version="2.1.0",
+    version="2.2.0",
     description=(
         "Arabic NLP service with CAMeL Tools when available, optional Farasa hook, "
         "improved clitic-aware fallback, classification, summarization, and tag suggestion."
@@ -84,6 +84,18 @@ KNOWN_VERBS = {
     "أستيقظ", "استيقظ", "أدرك", "ادرك", "استعدوا", "فتحت", "أصبحت", "اصبحت", "أحمل", "احمل", "أضم", "اضم",
     "يهمك", "تحتاج", "نعرض", "يلي", "ساءت", "ليست", "فليست"
 }
+
+# Words whose final/initial letters are lexical, not detachable clitics.
+# This list addresses recurrent false splits observed in the paired platform reports.
+LEXICAL_NO_SPLIT = nset({
+    "الذي", "التي", "الذين", "اللاتي", "اللائي", "اللذان", "اللتان",
+    "الماضي", "ماضي", "فجأة", "يهذي", "يأتي", "يلي", "يجتاحني",
+    "هذيانا", "جنونا", "حلما", "صفحة", "صفحات", "عملية", "الحياة",
+    "حاسوبية", "عربية", "ثرية", "لتوه"
+})
+
+VALID_PREFIX_CLITICS = {"و", "ف", "ب", "ك", "ل"}
+VALID_SUFFIX_PRONOUNS = ["كما", "هما", "كم", "كن", "نا", "ها", "هم", "هن", "ه", "ك", "ي"]
 
 CATEGORY_KEYWORDS = {
     "شعر": ["قصيدة", "بيت", "قافية", "شاعر", "أبيات", "بحر", "غزل"],
@@ -147,75 +159,125 @@ def is_single_letter_particle(part: str) -> bool:
 # Clitic splitting
 # -----------------------------------------------------------------------------
 
-def split_attached_word(surface: str) -> List[str]:
-    """Split common Arabic proclitics/enclitics for the platform output.
+def _looks_like_real_prefix(surface: str, prefix: str, rest: str) -> bool:
+    n = normalize(surface)
+    nr = normalize(rest)
+    if n in LEXICAL_NO_SPLIT or len(rest) < 2:
+        return False
+    if prefix in {"و", "ف"}:
+        return (nr in PRONOUNS or nr in PARTICLES or nr in DEMONSTRATIVES or
+                nr in RELATIVES or nr in INTERROGATIVES or nr.startswith("ال") or
+                nr in KNOWN_VERBS_N or len(rest) >= 3)
+    if prefix in {"ب", "ك", "ل"}:
+        return nr.startswith("ال") or nr in PRONOUNS or len(rest) >= 3
+    return False
 
-    This is intentionally conservative and designed to match the project report style:
-    وأوزانها -> و + أوزان + ها
-    بجذورها -> ب + جذور + ها
-    إلى stays one token.
+
+def split_attached_word(surface: str) -> List[str]:
+    """Conservative fallback segmentation used only when CAMeL is unavailable.
+
+    CAMeL-enabled requests are segmented from the selected CAMeL analysis, not
+    merely from spelling. This prevents errors such as الذي -> الذ + ي and
+    فجأة -> ف + جأة.
     """
     w = clean_word(surface)
     if not w:
         return []
-
     n = normalize(w)
-    if n in PREPOSITIONS or n in CONJUNCTIONS or n in PARTICLES or n in PRONOUNS:
+    if n in PREPOSITIONS or n in CONJUNCTIONS or n in PARTICLES or n in PRONOUNS or n in LEXICAL_NO_SPLIT:
         return [w]
 
     parts: List[str] = []
+    first = w[0]
+    rest = w[1:]
+    if normalize(first) in VALID_PREFIX_CLITICS and _looks_like_real_prefix(w, normalize(first), rest):
+        parts.append(first)
+        w = rest
+        n = normalize(w)
 
-    # Conjunction proclitic: و / ف
-    if len(w) > 2 and normalize(w[0]) in {"و", "ف"}:
-        rest = w[1:]
-        rest_n = normalize(rest)
-        # Do not split if the whole word is a known lexical item; otherwise split.
-        if n not in KNOWN_VERBS_N and rest_n not in {"احد", "اخر"}:
-            parts.append(w[0])
-            w = rest
-            n = normalize(w)
-
-    # Prepositional proclitic: ب / ك / ل
-    # Avoid false split in verbs/nouns like بناه, كان, كتب when the whole word is known.
-    if len(w) > 3 and normalize(w[0]) in {"ب", "ك", "ل"} and n not in KNOWN_VERBS_N:
-        rest = w[1:]
-        if len(rest) >= 2:
-            parts.append(w[0])
-            w = rest
-            n = normalize(w)
-
-    # Suffix pronouns. Longest first.
+    # Split suffixes only when the remaining base is plausible. Never strip final
+    # yaa from lexical forms merely because it resembles a possessive pronoun.
     suffix = ""
-    for s in ["كما", "هما", "كم", "كن", "نا", "ها", "هم", "هن", "ه", "ك", "ي"]:
-        if len(w) > len(s) + 2 and normalize(w).endswith(normalize(s)):
-            # Avoid stripping final ي from ordinary nisba/adjectives when no obvious pronoun context.
-            if s == "ي" and normalize(w).endswith(("ية", "عي", "سي", "بي")):
-                continue
+    for s in VALID_SUFFIX_PRONOUNS:
+        if not normalize(w).endswith(normalize(s)) or len(w) <= len(s) + 2:
+            continue
+        base = w[:-len(s)]
+        nb = normalize(base)
+        if s == "ي" and normalize(surface) not in {"نفسي", "قلبي", "كتابي", "بيتي", "عالمي"}:
+            continue
+        if nb in LEXICAL_NO_SPLIT or nb.endswith(("ا", "ى")):
+            continue
+        if nb in KNOWN_VERBS_N or nb.startswith("ال") or len(base) >= 3:
             suffix = w[-len(s):]
-            w = w[:-len(s)]
+            w = base
             break
 
     if w:
         parts.append(w)
     if suffix:
         parts.append(suffix)
-
     return parts or [clean_word(surface)]
 
 
 def expanded_tokens(text: str, split_clitics: bool = True) -> List[Tuple[str, str, str]]:
-    """Return (surface, part, position) where position is 1.1 style."""
     out: List[Tuple[str, str, str]] = []
     for word_index, surface in enumerate(words(text), start=1):
         parts = split_attached_word(surface) if split_clitics else [surface]
-        sub = 1
-        for part in parts:
+        for sub, part in enumerate(parts, start=1):
             part = clean_word(part)
-            if not part:
-                continue
-            out.append((surface, part, f"{word_index}.{sub}"))
-            sub += 1
+            if part:
+                out.append((surface, part, f"{word_index}.{sub}"))
     return out
+
+
+def _camel_has_clitic(value: Any) -> bool:
+    v = str(value or "").strip().lower()
+    return v not in {"", "0", "na", "none", "null", "_"}
+
+
+def _camel_prefix_letters(ana: Dict[str, Any], surface: str) -> List[str]:
+    """Return only detachable conjunction/preposition letters.
+
+    The definite article and verbal inflectional prefixes remain attached.
+    """
+    values = " ".join(str(ana.get(k, "")) for k in ("prc3", "prc2", "prc1", "prc0")).lower()
+    result: List[str] = []
+    cursor = surface
+    mapping = [("wa", "و"), ("fa", "ف"), ("bi", "ب"), ("ka", "ك"), ("li", "ل") ]
+    for code, letter in mapping:
+        if cursor.startswith(letter) and (code + "_" in values or code in values.split()):
+            result.append(letter)
+            cursor = cursor[1:]
+    return result
+
+
+def camel_units_for_word(surface: str, ana: Dict[str, Any], word_index: int, split_clitics: bool) -> List[Tuple[str, str, str]]:
+    """Segment a surface word only when the selected CAMeL analysis confirms it."""
+    clean = clean_word(surface)
+    if not clean or not split_clitics or normalize(clean) in LEXICAL_NO_SPLIT:
+        return [(clean, clean, f"{word_index}.1")] if clean else []
+
+    prefixes = _camel_prefix_letters(ana, clean)
+    remainder = clean[len(prefixes):]
+    suffix = ""
+    enc0 = ana.get("enc0")
+    if _camel_has_clitic(enc0):
+        for candidate in VALID_SUFFIX_PRONOUNS:
+            if normalize(remainder).endswith(normalize(candidate)) and len(remainder) > len(candidate) + 1:
+                # final yaa is detached only when CAMeL explicitly identifies enc0.
+                suffix = remainder[-len(candidate):]
+                remainder = remainder[:-len(candidate)]
+                break
+
+    units: List[Tuple[str, str, str]] = []
+    sub = 1
+    for prefix in prefixes:
+        units.append((clean, prefix, f"{word_index}.{sub}")); sub += 1
+    if remainder:
+        units.append((clean, remainder, f"{word_index}.{sub}")); sub += 1
+    if suffix:
+        units.append((clean, suffix, f"{word_index}.{sub}"))
+    return units or [(clean, clean, f"{word_index}.1")]
 
 
 # -----------------------------------------------------------------------------
@@ -487,26 +549,42 @@ def camel_token(surface: str, part: str, position: str, ana: Dict[str, Any]) -> 
     }
 
 
-def camel_analyze_units(units: List[Tuple[str, str, str]]) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+def camel_analyze_text(text: str, split_clitics: bool = True) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str], int]:
     mle = get_camel_mle()
     if mle is None:
-        return None, _camel_load_error
+        return None, _camel_load_error, 0
 
-    parts = [part for _, part, _ in units]
+    surface_words = words(text)
     try:
-        disambig = mle.disambiguate(parts)
+        disambig = mle.disambiguate(surface_words)
     except Exception as exc:
-        return None, str(exc)
+        return None, str(exc), 0
 
     out: List[Dict[str, Any]] = []
-    for unit, item in zip(units, disambig):
-        surface, part, position = unit
+    repaired = 0
+    for word_index, (surface, item) in enumerate(zip(surface_words, disambig), start=1):
         if not getattr(item, "analyses", None):
-            out.append(fallback_token(surface, part, position))
+            units = expanded_tokens(surface, split_clitics=split_clitics)
+            for _, part, position in units:
+                out.append(fallback_token(surface, part, position))
             continue
+
         ana = item.analyses[0].analysis
-        out.append(camel_token(surface, part, position, ana))
-    return out, None
+        units = camel_units_for_word(surface, ana, word_index, split_clitics)
+        if len(units) > 1:
+            repaired += 1
+
+        # Analyze detachable units contextually only where needed. The lexical core
+        # retains the selected whole-word analysis; clitic rows use safe rule labels.
+        lexical_indexes = [i for i, (_, part, _) in enumerate(units) if normalize(part) not in VALID_PREFIX_CLITICS and normalize(part) not in PRONOUNS]
+        lexical_index = lexical_indexes[0] if lexical_indexes else 0
+        for unit_index, (unit_surface, part, position) in enumerate(units):
+            npart = normalize(part)
+            if npart in VALID_PREFIX_CLITICS or (npart in PRONOUNS and unit_index != lexical_index):
+                out.append(fallback_token(unit_surface, part, position))
+            else:
+                out.append(camel_token(unit_surface, part, position, ana))
+    return out, None, repaired
 
 
 # -----------------------------------------------------------------------------
@@ -543,7 +621,7 @@ def health() -> Dict[str, Any]:
     return {
         "ok": True,
         "service": "Arabic NLP Service",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "camel_tools_available": camel_tools_installed(),
         "camel_model_loaded": mle is not None,
         "camel_model_error": None if mle is not None else _camel_load_error,
@@ -559,9 +637,10 @@ def analyze(req: AnalyzeRequest) -> Dict[str, Any]:
     debug: Dict[str, Any] = {}
 
     if req.engine in {"auto", "camel"}:
-        tokens, err = camel_analyze_units(units)
+        tokens, err, repaired = camel_analyze_text(req.text, split_clitics=req.split_clitics)
         if tokens is not None:
-            engine_used = "camel-tools+clitic-rules"
+            engine_used = "camel-tools+validated-clitics"
+            debug["validated_segmented_words"] = repaired
         elif err:
             debug["camel_error"] = err
 
@@ -583,6 +662,7 @@ def analyze(req: AnalyzeRequest) -> Dict[str, Any]:
             "token_count": len(tokens),
             "pos_counts": dict(pos_counts),
             "split_clitics": req.split_clitics,
+            "segmentation_mode": "camel-confirmed" if engine_used.startswith("camel-tools") else "conservative-rules",
         },
         "tokens": tokens,
     }
