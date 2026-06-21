@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(
     title="Arabic Linguistic Platform NLP API",
-    version="2.2.0",
+    version="2.3.0",
     description=(
         "Arabic NLP service with CAMeL Tools when available, optional Farasa hook, "
         "improved clitic-aware fallback, classification, summarization, and tag suggestion."
@@ -369,6 +369,58 @@ def guess_root(stem: str) -> str:
     return "".join(letters[:3]) if letters else n[:3]
 
 
+def sanitize_root_value(root: Any, word: str = "", lemma: str = "") -> str:
+    raw = str(root or "").strip()
+    if re.search(r"[A-Za-z]", raw) or raw.upper() in {"NTWS", "NA", "N/A", "NONE", "NULL", "UNK", "UNKNOWN"}:
+        raw = ""
+    raw = "".join(AR_WORD.findall(strip_diacritics(raw)))
+    key = normalize(word or lemma)
+    exact = {
+        "الوقت": "وقت", "وقت": "وقت",
+        "الذي": "", "التي": "", "الذين": "", "اللاتي": "", "اللائي": "",
+        "صفحات": "صفح", "صفحة": "صفح",
+        "نماذج": "نمذج", "نموذج": "نمذج",
+        "نصوص": "نصص", "نص": "نصص",
+        "الفنون": "فنن", "فنون": "فنن", "فن": "فنن",
+    }
+    if key in exact:
+        return exact[key]
+    return raw or guess_root(lemma or word)
+
+
+def derive_arabic_pattern(word: str, lemma: str = "", pos: str = "") -> str:
+    w = normalize(word)
+    if w in PARTICLES or w in PREPOSITIONS or w in CONJUNCTIONS:
+        return "أداة"
+    if w in RELATIVES:
+        return "اسم موصول مبني (لا وزن صرفي)"
+    if w in PRONOUNS:
+        return "ضمير مبني (لا وزن صرفي)"
+    if w in DEMONSTRATIVES:
+        return "اسم إشارة مبني (لا وزن صرفي)"
+    exact = {
+        "الوقت": "فَعْل", "وقت": "فَعْل",
+        "صفحات": "فَعَلات (جمع مؤنث سالم)",
+        "نماذج": "فَعَالِل (جمع تكسير)",
+        "نصوص": "فُعُول (جمع تكسير)",
+        "الفنون": "فُعُول (جمع تكسير)", "فنون": "فُعُول (جمع تكسير)",
+    }
+    if w in exact:
+        return exact[w]
+    if w.endswith("ات") and len(w) >= 4:
+        return "جمع مؤنث سالم"
+    if w.endswith(("ون", "ين")) and len(w) >= 4:
+        return "جمع مذكر سالم محتمل"
+    return "غير محدد"
+
+
+def sanitize_pattern_value(pattern: Any, word: str = "", lemma: str = "", pos: str = "") -> str:
+    raw = str(pattern or "").strip()
+    invalid = (not raw or raw == "غير محدد" or bool(re.search(r"[A-Za-z#0-9]", raw))
+               or raw.upper() in {"NTWS", "NA", "N/A", "NONE", "NULL", "UNK", "UNKNOWN"})
+    return derive_arabic_pattern(word, lemma, pos) if invalid else raw
+
+
 def fallback_token(surface: str, part: str, position: str) -> Dict[str, Any]:
     clean = clean_word(part)
     n = normalize(clean)
@@ -380,8 +432,8 @@ def fallback_token(surface: str, part: str, position: str) -> Dict[str, Any]:
         "word": clean,
         "normalized": n,
         "lemma": normalize(stem) if stem else n,
-        "root": guess_root(stem if stem else clean),
-        "pattern": "غير محدد",
+        "root": sanitize_root_value("", clean, normalize(stem) if stem else n),
+        "pattern": derive_arabic_pattern(clean, normalize(stem) if stem else n, pos),
         "pos": pos,
         "prefix": prefix,
         "stem": stem,
@@ -529,9 +581,11 @@ def camel_token(surface: str, part: str, position: str, ana: Dict[str, Any]) -> 
 
     prefix, fallback_stem, suffix = fallback_stem_prefix_suffix(clean, pos)
     lemma = ana.get("lex") or ana.get("lemma") or normalize(fallback_stem or clean)
-    root = ana.get("root") or guess_root(fallback_stem or clean)
+    root = sanitize_root_value(ana.get("root"), clean, str(lemma))
     stem = ana.get("stem") or fallback_stem or clean
-    pattern = ana.get("pattern") or ana.get("bw") or "غير محدد"
+    # `bw` is a Buckwalter analysis string, not a morphological pattern.
+    # Using it here caused NTWS and malformed numeric templates in the UI.
+    pattern = sanitize_pattern_value(ana.get("pattern"), clean, str(lemma), pos)
 
     return {
         "position": position,
@@ -622,7 +676,7 @@ def health() -> Dict[str, Any]:
     return {
         "ok": True,
         "service": "Arabic NLP Service",
-        "version": "2.2.0",
+        "version": "2.3.0",
         "camel_tools_available": camel_tools_installed(),
         "camel_model_loaded": mle is not None,
         "camel_model_error": None if mle is not None else _camel_load_error,
