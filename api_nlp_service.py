@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(
     title="Arabic Linguistic Platform NLP API",
-    version="2.3.0",
+    version="2.4.0",
     description=(
         "Arabic NLP service with CAMeL Tools when available, optional Farasa hook, "
         "improved clitic-aware fallback, classification, summarization, and tag suggestion."
@@ -145,7 +145,10 @@ def clean_word(word: str) -> str:
 
 
 def words(text: str) -> List[str]:
-    return [w for w in (clean_word(x) for x in AR_WORD.findall(text or "")) if w]
+    # Remove diacritics before tokenization. Otherwise a final tanween such as
+    # نجاحًا is incorrectly tokenized as "نجاح" + "ا".
+    plain = strip_diacritics(text or "")
+    return [w for w in (clean_word(x) for x in AR_WORD.findall(plain)) if w]
 
 
 def sentences(text: str) -> List[str]:
@@ -352,11 +355,13 @@ def fallback_stem_prefix_suffix(w: str, pos: str) -> Tuple[str, str, str]:
         prefix = "ال"
         stem = w[2:]
 
-    for s in ["كما", "هما", "كم", "كن", "نا", "ها", "هم", "هن", "ه", "ك", "ي"]:
-        if len(stem) > len(s) + 2 and normalize(stem).endswith(normalize(s)):
-            suffix = stem[-len(s):]
-            stem = stem[:-len(s)]
-            break
+    # Do not interpret lexical final letters as pronouns (الذي، الماضي، يهذي...).
+    if n not in LEXICAL_NO_SPLIT:
+        for s in ["كما", "هما", "كم", "كن", "نا", "ها", "هم", "هن", "ه", "ك", "ي"]:
+            if len(stem) > len(s) + 2 and normalize(stem).endswith(normalize(s)):
+                suffix = stem[-len(s):]
+                stem = stem[:-len(s)]
+                break
     return prefix, stem, suffix
 
 
@@ -556,6 +561,100 @@ def arabic_camel_features(ana: Dict[str, Any], part: str, pos: str) -> str:
     return "، ".join(features)
 
 
+_BW_FALLBACK = str.maketrans({
+    "'": "ء", "|": "آ", ">": "أ", "&": "ؤ", "<": "إ", "}": "ئ",
+    "A": "ا", "b": "ب", "p": "ة", "t": "ت", "v": "ث", "j": "ج",
+    "H": "ح", "x": "خ", "d": "د", "*": "ذ", "r": "ر", "z": "ز",
+    "s": "س", "$": "ش", "S": "ص", "D": "ض", "T": "ط", "Z": "ظ",
+    "E": "ع", "g": "غ", "f": "ف", "q": "ق", "k": "ك", "l": "ل",
+    "m": "م", "n": "ن", "h": "ه", "w": "و", "Y": "ى", "y": "ي",
+    "F": "ً", "N": "ٌ", "K": "ٍ", "a": "َ", "u": "ُ", "i": "ِ",
+    "~": "ّ", "o": "ْ", "`": "ٰ"
+})
+
+
+def camel_arabic_value(value: Any) -> str:
+    """Convert CAMeL/Buckwalter text to Arabic when necessary."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if re.search(r"[A-Za-z$*><&|{}']", raw):
+        try:
+            from camel_tools.utils.charmap import CharMapper
+            raw = CharMapper.builtin_mapper("bw2ar")(raw)
+        except Exception:
+            raw = raw.translate(_BW_FALLBACK)
+    return raw
+
+
+def camel_root_value(value: Any, word: str = "", lemma: str = "") -> str:
+    raw = camel_arabic_value(value)
+    # Roots may be dot-separated (و.ق.ت). Preserve Arabic radicals only.
+    raw = "".join(AR_WORD.findall(strip_diacritics(raw)))
+    return sanitize_root_value(raw, word, lemma)
+
+
+def grammatical_affixes(surface: str, ana: Dict[str, Any], pos: str, fallback_prefix: str = "", fallback_suffix: str = "") -> Tuple[str, str]:
+    """Return inflectional prefixes/suffixes without creating standalone rows.
+
+    Detachable conjunctions/prepositions are represented as rows. Here we keep
+    verbal markers (س، أ/ن/ي/ت) and endings (وا، ان...) in prefix/suffix fields.
+    """
+    w = clean_word(surface)
+    n = normalize(w)
+    prefixes: List[str] = []
+    suffixes: List[str] = []
+
+    # Definite article remains attached to nouns.
+    if pos == "اسم" and n.startswith("ال") and len(n) > 3:
+        prefixes.append("ال")
+
+    if pos == "فعل":
+        cursor = n
+        if cursor.startswith("س") and len(cursor) >= 4 and cursor[1:2] in {"ا", "ن", "ي", "ت"}:
+            prefixes.append("س")
+            cursor = cursor[1:]
+        asp = str(ana.get("asp") or "")
+        if asp == "i" and cursor[:1] in {"ا", "ن", "ي", "ت"}:
+            prefixes.append(cursor[:1])
+
+        # Longest first; these are inflectional endings, not independent tokens.
+        for ending in ("تما", "تن", "تم", "وا", "ان", "ون", "ين", "نا", "ن", "ت"):
+            if n.endswith(ending) and len(n) > len(ending) + 2:
+                suffixes.append(ending)
+                break
+    elif pos == "اسم":
+        for ending in ("ات", "ان", "ون", "ين"):
+            if n.endswith(ending) and len(n) > len(ending) + 2:
+                suffixes.append(ending)
+                break
+
+    # Object/possessive pronouns confirmed by CAMeL.
+    if _camel_has_clitic(ana.get("enc0")):
+        for ending in VALID_SUFFIX_PRONOUNS:
+            if n.endswith(normalize(ending)) and len(n) > len(ending) + 1:
+                if ending not in suffixes:
+                    suffixes.append(ending)
+                break
+
+    if fallback_prefix and fallback_prefix not in prefixes:
+        prefixes.insert(0, fallback_prefix)
+    if fallback_suffix and fallback_suffix not in suffixes:
+        suffixes.append(fallback_suffix)
+    return "+".join(prefixes), "+".join(suffixes)
+
+
+def infer_stem_from_surface(surface: str, prefix: str, suffix: str, lemma: str) -> str:
+    w = clean_word(surface)
+    for p in [x for x in prefix.split("+") if x]:
+        if w.startswith(p) and len(w) > len(p):
+            w = w[len(p):]
+    for s in reversed([x for x in suffix.split("+") if x]):
+        if w.endswith(s) and len(w) > len(s):
+            w = w[:-len(s)]
+    return w or clean_word(strip_diacritics(lemma)) or clean_word(surface)
+
+
 def camel_token(surface: str, part: str, position: str, ana: Dict[str, Any]) -> Dict[str, Any]:
     clean = clean_word(part)
     n = normalize(clean)
@@ -579,13 +678,15 @@ def camel_token(surface: str, part: str, position: str, ana: Dict[str, Any]) -> 
             "confidence": "camel-tools+rules",
         }
 
-    prefix, fallback_stem, suffix = fallback_stem_prefix_suffix(clean, pos)
-    lemma = ana.get("lex") or ana.get("lemma") or normalize(fallback_stem or clean)
-    root = sanitize_root_value(ana.get("root"), clean, str(lemma))
-    stem = ana.get("stem") or fallback_stem or clean
+    fallback_prefix, fallback_stem, fallback_suffix = fallback_stem_prefix_suffix(clean, pos)
+    lemma = camel_arabic_value(ana.get("lex") or ana.get("lemma")) or normalize(fallback_stem or clean)
+    lemma = strip_diacritics(lemma).replace("_", "")
+    root = camel_root_value(ana.get("root"), clean, str(lemma))
+    prefix, suffix = grammatical_affixes(clean, ana, pos, fallback_prefix, fallback_suffix)
+    stem_raw = camel_arabic_value(ana.get("stem"))
+    stem = clean_word(strip_diacritics(stem_raw)) or infer_stem_from_surface(clean, prefix, suffix, str(lemma))
     # `bw` is a Buckwalter analysis string, not a morphological pattern.
-    # Using it here caused NTWS and malformed numeric templates in the UI.
-    pattern = sanitize_pattern_value(ana.get("pattern"), clean, str(lemma), pos)
+    pattern = sanitize_pattern_value(camel_arabic_value(ana.get("pattern")), clean, str(lemma), pos)
 
     return {
         "position": position,
@@ -676,7 +777,7 @@ def health() -> Dict[str, Any]:
     return {
         "ok": True,
         "service": "Arabic NLP Service",
-        "version": "2.3.0",
+        "version": "2.4.0",
         "camel_tools_available": camel_tools_installed(),
         "camel_model_loaded": mle is not None,
         "camel_model_error": None if mle is not None else _camel_load_error,
