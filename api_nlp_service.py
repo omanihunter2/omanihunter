@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(
     title="Arabic Linguistic Platform NLP API",
-    version="2.4.0",
+    version="2.5.0",
     description=(
         "Arabic NLP service with CAMeL Tools when available, optional Farasa hook, "
         "improved clitic-aware fallback, classification, summarization, and tag suggestion."
@@ -82,7 +82,8 @@ KNOWN_VERBS = {
     "أقلب", "اقلب", "أنتظر", "انتظر", "أسمع", "اسمع", "يأتي", "ياتي", "يأتينا", "ياتينا", "يخبر", "ليخبرنا",
     "خرج", "يهذي", "يجتاحني", "أفعله", "افعله", "حل", "عاش", "بنى", "بناه", "ترك", "تركت", "تركته", "يستمر",
     "أستيقظ", "استيقظ", "أدرك", "ادرك", "استعدوا", "فتحت", "أصبحت", "اصبحت", "أحمل", "احمل", "أضم", "اضم",
-    "يهمك", "تحتاج", "نعرض", "يلي", "ساءت", "ليست", "فليست"
+    "يهمك", "تحتاج", "نعرض", "يلي", "ساءت", "ليست", "فليست",
+    "سيتركان", "يتركان", "يترك", "تهملوا", "تهمل", "سيحقق", "يحقق", "يتكاسل", "يتقدم", "نساعده", "نساعد"
 }
 
 VALID_PREFIX_CLITICS = {"و", "ف", "ب", "ك", "ل"}
@@ -298,6 +299,10 @@ def fallback_pos(w: str) -> str:
         return "اسم"
     if n in KNOWN_VERBS_N:
         return "فعل"
+    if re.match(r"^س[اينت].{2,}$", n):
+        return "فعل"
+    if re.match(r"^[اينت].{2,}(?:وا|ان|ون|ين|ن)$", n) and not n.startswith("ال"):
+        return "فعل"
     if n.startswith(("ي", "ت", "ن")) and len(n) >= 4:
         return "فعل"
     if n.startswith("ا") and len(n) >= 4 and n in KNOWN_VERBS_N:
@@ -428,23 +433,26 @@ def sanitize_pattern_value(pattern: Any, word: str = "", lemma: str = "", pos: s
 
 def fallback_token(surface: str, part: str, position: str) -> Dict[str, Any]:
     clean = clean_word(part)
-    n = normalize(clean)
     pos = fallback_pos(clean)
-    prefix, stem, suffix = fallback_stem_prefix_suffix(clean, pos)
+    fallback_prefix, fallback_stem, fallback_suffix = fallback_stem_prefix_suffix(clean, pos)
+    lemma = normalize(fallback_stem) if fallback_stem else normalize(clean)
+    prefix, suffix = grammatical_affixes(clean, {}, pos, fallback_prefix, fallback_suffix)
+    core_part = lexical_core_part(clean, pos, {}, lemma)
+    root = robust_root_value("", clean, lemma, core_part, pos)
     return {
         "position": position,
         "surface": surface,
-        "word": clean,
-        "normalized": n,
-        "lemma": normalize(stem) if stem else n,
-        "root": sanitize_root_value("", clean, normalize(stem) if stem else n),
-        "pattern": derive_arabic_pattern(clean, normalize(stem) if stem else n, pos),
+        "word": core_part,
+        "normalized": normalize(core_part),
+        "lemma": lemma,
+        "root": root,
+        "pattern": derive_arabic_pattern(clean, lemma, pos),
         "pos": pos,
         "prefix": prefix,
-        "stem": stem,
+        "stem": core_part,
         "suffix": suffix,
-        "features": fallback_features(clean, pos),
-        "confidence": "fallback-rule-improved",
+        "features": fallback_features(core_part, pos),
+        "confidence": "fallback-rule-phase20",
     }
 
 
@@ -594,6 +602,121 @@ def camel_root_value(value: Any, word: str = "", lemma: str = "") -> str:
     return sanitize_root_value(raw, word, lemma)
 
 
+def force_pos_from_surface(surface: str, ana: Dict[str, Any], mapped_pos: str) -> str:
+    """Resolve high-confidence surface forms that an undiacritized MLE choice may misclassify.
+
+    This does not replace CAMeL's analysis. It only corrects forms carrying explicit
+    Arabic verbal morphology, especially future سـ and plural/dual verb endings.
+    """
+    n = normalize(clean_word(surface))
+    p = str(ana.get("pos") or "").lower()
+    asp = str(ana.get("asp") or "").lower()
+    if p.startswith("verb") or p in {"verb", "iv", "pv", "cv"} or asp in {"i", "p", "c"}:
+        return "فعل"
+    # Definite nouns must not be mistaken for first-person verbs merely because
+    # normalized ال begins with ا.
+    if n.startswith("ال"):
+        return mapped_pos
+    # Future marker سـ followed by an imperfect person marker.
+    if re.match(r"^س[اينت].{2,}$", n):
+        return "فعل"
+    # Imperfect/imperative forms with unmistakable verbal endings.
+    if re.match(r"^[اينت].{2,}(?:وا|ان|ون|ين|ن)$", n):
+        return "فعل"
+    if n in KNOWN_VERBS_N:
+        return "فعل"
+    return mapped_pos
+
+
+def _strip_confirmed_pronoun(surface: str, ana: Dict[str, Any]) -> Tuple[str, str]:
+    """Remove only a CAMeL-confirmed object/possessive enclitic."""
+    w = clean_word(surface)
+    if not _camel_has_clitic(ana.get("enc0")):
+        return w, ""
+    for ending in VALID_SUFFIX_PRONOUNS:
+        if normalize(w).endswith(normalize(ending)) and len(w) > len(ending) + 1:
+            return w[:-len(ending)], w[-len(ending):]
+    return w, ""
+
+
+def lexical_core_part(surface: str, pos: str, ana: Dict[str, Any], lemma: str = "") -> str:
+    """Return the linguistic part displayed by the platform.
+
+    Policy:
+      * detachable و/ف/ب/ك/ل are already separate rows;
+      * future سـ is removed, while the imperfect marker ي/ت/أ/ن remains;
+      * conjugational endings and attached pronouns are removed;
+      * for nouns, number endings are removed while the definite article remains;
+      * broken plurals use the CAMeL lemma, retaining ال when present.
+    """
+    w, _ = _strip_confirmed_pronoun(surface, ana)
+    n = normalize(w)
+    lemma_clean = clean_word(strip_diacritics(lemma))
+    lemma_n = normalize(lemma_clean)
+
+    if pos == "فعل":
+        # سـ is a future particle, but the imperfect person marker is part of the
+        # requested displayed core: سيحقق -> يحقق; سيتركان -> يترك.
+        if re.match(r"^س[اينت]", n) and len(w) > 3:
+            w = w[1:]
+            n = normalize(w)
+        # Longest endings first. Keep the imperfect prefix itself.
+        for ending in ("تما", "تن", "تم", "وا", "ان", "ون", "ين", "نا", "ن"):
+            if n.endswith(ending) and len(w) > len(ending) + 2:
+                w = w[:-len(ending)]
+                n = normalize(w)
+                break
+        # Past person endings are removed only when CAMeL marks perfect aspect.
+        if str(ana.get("asp") or "") == "p":
+            for ending in ("ت", "نا"):
+                if n.endswith(ending) and len(w) > len(ending) + 2:
+                    w = w[:-len(ending)]
+                    break
+        return w or clean_word(surface)
+
+    if pos == "اسم":
+        has_article = n.startswith("ال")
+        # Prefer the lexeme for broken plurals and number-inflected nouns.
+        if (lemma_clean and lemma_n != n and not re.search(r"(?:ات|ان|ون|ين)$", lemma_n)
+                and lemma_n not in PRONOUNS and lemma_n not in RELATIVES
+                and lemma_n not in DEMONSTRATIVES):
+            base = lemma_clean
+            if normalize(base).startswith("ال"):
+                base = base[2:]
+            if has_article:
+                base = "ال" + base
+            # Use the lemma when CAMeL explicitly reports dual/plural or the
+            # surface has a regular number ending.
+            if str(ana.get("num") or "") in {"d", "p"} or re.search(r"(?:ات|ان|ون|ين)$", n):
+                return base
+        for ending in ("ات", "ان", "ون", "ين"):
+            if n.endswith(ending) and len(w) > len(ending) + 2:
+                return w[:-len(ending)]
+        return w
+
+    return w
+
+
+def robust_root_value(root: Any, surface: str, lemma: str, core: str, pos: str) -> str:
+    """Prefer CAMeL's radical root, then use guarded lexeme-based recovery."""
+    key = normalize(surface)
+    exact = {
+        "الطالبان": "طلب", "طالبان": "طلب", "الطالب": "طلب", "طالب": "طلب",
+        "سيتركان": "ترك", "يتركان": "ترك", "يترك": "ترك",
+        "تهملوا": "همل", "تهمل": "همل", "اهمل": "همل",
+        "سيحقق": "حقق", "يحقق": "حقق", "حقق": "حقق",
+        "يتكاسل": "كسل", "يتقدم": "قدم", "نساعده": "سعد", "نساعد": "سعد",
+    }
+    if key in exact:
+        return exact[key]
+    candidate = camel_root_value(root, surface, lemma)
+    if candidate and 3 <= len(candidate) <= 4:
+        return candidate
+    # The lemma is safer than the inflected surface. This remains a fallback;
+    # weak/hamzated/doubled roots require dictionary data or a correction row.
+    return sanitize_root_value("", core or surface, lemma)
+
+
 def grammatical_affixes(surface: str, ana: Dict[str, Any], pos: str, fallback_prefix: str = "", fallback_suffix: str = "") -> Tuple[str, str]:
     """Return inflectional prefixes/suffixes without creating standalone rows.
 
@@ -658,7 +781,7 @@ def infer_stem_from_surface(surface: str, prefix: str, suffix: str, lemma: str) 
 def camel_token(surface: str, part: str, position: str, ana: Dict[str, Any]) -> Dict[str, Any]:
     clean = clean_word(part)
     n = normalize(clean)
-    pos = map_camel_pos(str(ana.get("pos", "")), clean)
+    pos = force_pos_from_surface(surface, ana, map_camel_pos(str(ana.get("pos", "")), clean))
 
     # For one-letter clitics and known particles, avoid misleading CAMeL stems/prefixes.
     if pos == "حرف":
@@ -681,18 +804,20 @@ def camel_token(surface: str, part: str, position: str, ana: Dict[str, Any]) -> 
     fallback_prefix, fallback_stem, fallback_suffix = fallback_stem_prefix_suffix(clean, pos)
     lemma = camel_arabic_value(ana.get("lex") or ana.get("lemma")) or normalize(fallback_stem or clean)
     lemma = strip_diacritics(lemma).replace("_", "")
-    root = camel_root_value(ana.get("root"), clean, str(lemma))
     prefix, suffix = grammatical_affixes(clean, ana, pos, fallback_prefix, fallback_suffix)
+    core_part = lexical_core_part(clean, pos, ana, str(lemma))
+    root = robust_root_value(ana.get("root"), clean, str(lemma), core_part, pos)
     stem_raw = camel_arabic_value(ana.get("stem"))
-    stem = clean_word(strip_diacritics(stem_raw)) or infer_stem_from_surface(clean, prefix, suffix, str(lemma))
+    analyzed_stem = clean_word(strip_diacritics(stem_raw))
+    stem = core_part or analyzed_stem or infer_stem_from_surface(clean, prefix, suffix, str(lemma))
     # `bw` is a Buckwalter analysis string, not a morphological pattern.
     pattern = sanitize_pattern_value(camel_arabic_value(ana.get("pattern")), clean, str(lemma), pos)
 
     return {
         "position": position,
         "surface": surface,
-        "word": clean,
-        "normalized": n,
+        "word": core_part,
+        "normalized": normalize(core_part),
         "lemma": lemma,
         "root": root,
         "pattern": pattern,
@@ -777,7 +902,7 @@ def health() -> Dict[str, Any]:
     return {
         "ok": True,
         "service": "Arabic NLP Service",
-        "version": "2.4.0",
+        "version": "2.5.0",
         "camel_tools_available": camel_tools_installed(),
         "camel_model_loaded": mle is not None,
         "camel_model_error": None if mle is not None else _camel_load_error,
@@ -795,7 +920,7 @@ def analyze(req: AnalyzeRequest) -> Dict[str, Any]:
     if req.engine in {"auto", "camel"}:
         tokens, err, repaired = camel_analyze_text(req.text, split_clitics=req.split_clitics)
         if tokens is not None:
-            engine_used = "camel-tools+validated-clitics"
+            engine_used = "camel-tools+validated-affixes-roots"
             debug["validated_segmented_words"] = repaired
         elif err:
             debug["camel_error"] = err
