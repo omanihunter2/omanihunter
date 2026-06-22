@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(
     title="Arabic Linguistic Platform NLP API",
-    version="2.5.0",
+    version="2.5.1",
     description=(
         "Arabic NLP service with CAMeL Tools when available, optional Farasa hook, "
         "improved clitic-aware fallback, classification, summarization, and tag suggestion."
@@ -649,10 +649,18 @@ def lexical_core_part(surface: str, pos: str, ana: Dict[str, Any], lemma: str = 
       * for nouns, number endings are removed while the definite article remains;
       * broken plurals use the CAMeL lemma, retaining ال when present.
     """
-    w, _ = _strip_confirmed_pronoun(surface, ana)
+    w, attached_pronoun = _strip_confirmed_pronoun(surface, ana)
     n = normalize(w)
     lemma_clean = clean_word(strip_diacritics(lemma))
     lemma_n = normalize(lemma_clean)
+
+    # When a possessive pronoun is attached to a noun ending in taa marbuta,
+    # Arabic orthography changes ة to ت: مدرسة + نا -> مدرستنا.
+    # Restore the lexical form after removing the confirmed pronoun.
+    if (pos == "اسم" and attached_pronoun and w.endswith("ت")
+            and lemma_clean.endswith("ة")):
+        w = w[:-1] + "ة"
+        n = normalize(w)
 
     if pos == "فعل":
         # سـ is a future particle, but the imperfect person marker is part of the
@@ -902,7 +910,7 @@ def health() -> Dict[str, Any]:
     return {
         "ok": True,
         "service": "Arabic NLP Service",
-        "version": "2.5.0",
+        "version": "2.5.1",
         "camel_tools_available": camel_tools_installed(),
         "camel_model_loaded": mle is not None,
         "camel_model_error": None if mle is not None else _camel_load_error,
